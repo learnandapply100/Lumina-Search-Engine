@@ -1,0 +1,13 @@
+node_modules/
+dist/
+web/dist/
+.env
+.env.*
+!.env.example
+atlas-credentials.env
+runs/
+reports/
+*.log
+.DS_Store
+MongoDBAtlas_DatabaseUser.rtf
+Claude_Memory_Text.md

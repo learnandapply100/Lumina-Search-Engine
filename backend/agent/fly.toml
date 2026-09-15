@@ -1,0 +1,53 @@
+# The AI backend. Deliberately has NO public service block and must have NO allocated public
+# IP: it holds every provider key and enforces the deep-search daily cap, and a cap you can
+# reach around by calling the service directly is not a cap. The gateway reaches it over Fly
+# private networking at lumina-agent.internal:8000.
+#
+#   fly launch --no-deploy --copy-config --dockerfile backend/agent/Dockerfile
+#   fly secrets set MONGODB_URI=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=... TAVILY_API_KEY=...
+#   fly deploy
+#   fly ips list          # MUST be empty. If not: fly ips release <addr>
+#
+# `app` and `worker` are two process groups from one image, which is how the indexer runs as
+# its own process without a second build: a 60-page PDF parse cannot then block an answer
+# that is mid-stream.
+
+app = "lumina-agent"
+primary_region = "syd"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  app = "node dist/index.js"
+  worker = "node dist/worker.js"
+
+[env]
+  PORT_AGENT = "8000"
+  NODE_ENV = "production"
+  VECTOR_BACKEND = "atlas-vector-search"
+  LLM_PROVIDER = "anthropic"
+  LLM_MODEL = "claude-sonnet-5"
+  SEARCH_PROVIDER = "tavily"
+  EMBEDDING_MODEL = "text-embedding-3-small"
+  MAX_TOOL_CALLS = "8"
+  MAX_WALL_CLOCK_SEC = "90"
+  MAX_TOOL_CALLS_DEEP = "24"
+  MAX_WALL_CLOCK_SEC_DEEP = "240"
+  DEEP_DAILY_CAP = "5"
+  DEEP_SUB_QUESTIONS_MIN = "3"
+  DEEP_SUB_QUESTIONS_MAX = "6"
+  SEARCH_CACHE_TTL_SECONDS = "21600"
+  LOG_LEVEL = "info"
+
+# One machine per group. The worker is not a web service and takes no traffic; the sweeper
+# is what makes a worker that dies mid-job recoverable rather than a stuck document.
+[[vm]]
+  processes = ["app"]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[[vm]]
+  processes = ["worker"]
+  size = "shared-cpu-1x"
+  memory = "1gb"

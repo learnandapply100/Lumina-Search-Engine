@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+web/dist
+.env
+.env.*
+!.env.example
+atlas-credentials.env
+runs
+*.log
+.git
+.DS_Store
