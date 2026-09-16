@@ -29,8 +29,13 @@ function releaseExtractSlot(): void {
   waiting.shift()?.();
 }
 
-/** Enough of a page to ground several claims, bounded so one long article cannot eat the context. */
-const MAX_CHARS = 12_000;
+/**
+ * Enough of a page to ground several claims, bounded so one long article cannot eat the
+ * context. Exported because there are now two readers — this one and Tavily's extract — and
+ * a page has to be clipped to the same length whichever produced it. Two constants that must
+ * agree are one constant waiting to drift.
+ */
+export const MAX_CHARS = 12_000;
 const FETCH_TIMEOUT_MS = 10_000;
 
 /**

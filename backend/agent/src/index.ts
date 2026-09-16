@@ -33,11 +33,16 @@ import { newAskRecord, runAsk } from './loop.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { writeRunLog } from './runlog.js';
 import { SseStream } from './sse.js';
+import { RequestTiming } from './timing.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
 
 app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.locals.receivedAt = performance.now();
+  next();
+});
 app.use((req, res, next) =>
   req.path.endsWith('/documents') && req.method === 'POST'
     ? next()
@@ -210,6 +215,25 @@ app.post('/threads/:threadId/ask', async (req, res) => {
   const ctx = auth(req, res);
   if (!ctx) return;
 
+  const record = newAskRecord(new RequestTiming(res.locals.receivedAt));
+  // Once per response, including rejected/failed quick requests. This runs when the stream
+  // closes, before any later persistence failure could cause a second answer log.
+  let timingLogged = false;
+  const logTiming = () => {
+    if (timingLogged || req.body?.depth === 'deep') return;
+    timingLogged = true;
+    log.info({
+      requestId: ctx.requestId,
+      depth: 'quick',
+      status: res.statusCode,
+      elapsedMs: record.timing.elapsedMs,
+      searchCached: record.timing.searchCached,
+      readers: record.readers
+    }, 'quick_timing');
+  };
+  res.once('finish', logTiming);
+  res.once('close', logTiming);
+
   const startedAt = Date.now();
   const database = await db();
   const threadId = req.params.threadId;
@@ -275,7 +299,6 @@ app.post('/threads/:threadId/ask', async (req, res) => {
 
   // Held out here so the catch below can read what the run had spent and done. A log written
   // from constants after an exception is a log that invents its own evidence.
-  const record = newAskRecord();
 
   try {
     const out = await runAsk({
@@ -360,7 +383,14 @@ app.post('/threads/:threadId/ask', async (req, res) => {
         ttftMs: out.ttftMs,
         latencyMs: out.latencyMs,
         depth,
-        sources: out.sources.length
+        sources: out.sources.length,
+        // Which reader grounded this answer, and how much extracted text the search provider
+        // gave us to work with. `rawText.withText: 0` against a non-zero `total` on Tavily is
+        // the signature of an extract request the provider ignored: every page silently falls
+        // back to being downloaded and parsed, the answer is still correct, and the only thing
+        // that changes is the latency this was meant to remove.
+        readers: record.readers,
+        rawText: record.rawText
       },
       'answer'
     );
@@ -382,7 +412,11 @@ app.post('/threads/:threadId/ask', async (req, res) => {
         tokens: { in: record.spend.tokensIn, out: record.spend.tokensOut },
         costUsd,
         subQuestions: record.subQuestions.length,
-        latencyMs: Date.now() - startedAt
+        latencyMs: Date.now() - startedAt,
+        // Reported on the failure path too: how far retrieval got before the run died is part
+        // of reading the trajectory, and a reader that returned nothing is a candidate cause.
+        readers: record.readers,
+        rawText: record.rawText
       },
       'ask failed'
     );
