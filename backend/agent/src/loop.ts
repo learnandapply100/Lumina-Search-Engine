@@ -235,7 +235,8 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
     searchResults,
     readers,
     rawText,
-    timing
+    timing,
+    ...(!isDeep ? { pendingSearchWrites: [] } : {})
   };
 
   const emitTrace = (ev: Omit<TraceEvent, 'step'>) => {
@@ -337,7 +338,23 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
       });
     });
   } else {
-    await researchQuick({ query, history, mode, spaceId, ctx, budget, emitTrace });
+    let researchFailure: { error: unknown } | undefined;
+    try {
+      await researchQuick({ query, history, mode, spaceId, ctx, budget, emitTrace });
+    } catch (error) {
+      researchFailure = { error };
+    }
+    // Drain even when routing/reading throws: no cache write outlives its request.
+    timing?.mark('searchCacheWaitStarted');
+    const results = await Promise.all((ctx.pendingSearchWrites ?? []).map(async (write) => {
+      const result = await write.promise;
+      write.report?.(result);
+      return result;
+    }));
+    timing?.mark('searchCacheWaitFinished');
+    const failed = results.find((result) => !result.ok);
+    if (failed && !failed.ok) throw failed.error;
+    if (researchFailure) throw researchFailure.error;
   }
 
   // ------------------------------------------------------------ read before giving up
@@ -492,15 +509,27 @@ async function runSeed(opts: {
   const { seed, ctx, emitTrace, subQuestion } = opts;
   const t0 = Date.now();
   try {
+    const pendingBefore = ctx.pendingSearchWrites?.length ?? 0;
     const out = await runTool(seed.tool, seed.input, ctx);
-    emitTrace({
+    const trace = {
       tool: seed.tool,
       input: seed.input,
       ok: true,
       ms: Date.now() - t0,
       reason: seed.reason,
       ...(subQuestion ? { subQuestion } : {})
-    });
+    };
+    const pending = ctx.pendingSearchWrites?.[pendingBefore];
+    if (pending) {
+      pending.report = (result) => emitTrace({
+        ...trace,
+        ms: Date.now() - t0,
+        ...(!result.ok ? {
+          ok: false,
+          error: `Search cache persistence failed: ${result.error instanceof Error ? result.error.message : String(result.error)}`
+        } : {})
+      });
+    } else emitTrace(trace);
     return out;
   } catch (err) {
     emitTrace({
@@ -555,11 +584,11 @@ async function planQuickReads(opts: {
   // NOT wrapped in try/catch: a provider exception here is the run's failure and has to reach
   // the caller as one. Only the *parse* below degrades, and it degrades visibly.
   const res = await createMessage({
-    model: env.llmModel,
+    model: env.routingModel,
     // Room for a saved preference sentence and nothing more. The output is the latency.
     max_tokens: 200,
     thinking: { type: 'disabled' },
-    output_config: { effort: 'low' },
+    //output_config: { effort: 'low' },
     system: [
       'You are the routing step of a cited search engine. You do two things and write no prose.',
       `First: choose the ${PREFETCH_COUNT} search results most likely to contain the answer, by index.`,
@@ -616,25 +645,37 @@ async function researchQuick(opts: {
   const { query, history, mode, spaceId, ctx, budget, emitTrace } = opts;
 
   const seed = seedFor(mode, query, spaceId);
+  const decide = () => {
+    ctx.timing?.mark('routingStarted');
+    return planQuickReads({ query, history, results: ctx.searchResults, spend: ctx.spend })
+      .finally(() => ctx.timing?.mark('routingFinished'));
+  };
+  // Documents never populate web candidates, so this existing call can decide memory while
+  // retrieval runs. Handle rejection immediately, then drain it even if retrieval fails.
+  const documentDecision = seed?.tool === 'search_documents'
+    ? decide().then(
+      (plan) => ({ ok: true as const, plan }),
+      (error: unknown) => ({ ok: false as const, error })
+    )
+    : undefined;
   if (seed && budget.reserve()) {
     ctx.timing?.mark('searchStarted');
     try {
       await runSeed({ seed, ctx, emitTrace });
-    } finally {
+    } catch (error) {
+      // Keep the search timing boundary at retrieval completion, before draining the decision.
       ctx.timing?.mark('searchFinished');
+      await documentDecision;
+      throw error;
+    } finally {
+      if (ctx.timing?.elapsedMs.searchFinished == null) ctx.timing?.mark('searchFinished');
     }
   }
 
-  // On the documents path the seed already put citable chunks in `evidence` — there are no URLs
-  // to choose between. The turn below still runs, because the memory decision is owed on every
-  // gear and every mode, and `planQuickReads` handles an empty candidate list.
-  ctx.timing?.mark('routingStarted');
-  const plan = await planQuickReads({
-    query,
-    history,
-    results: ctx.searchResults,
-    spend: ctx.spend
-  }).finally(() => ctx.timing?.mark('routingFinished'));
+  const decision = await documentDecision;
+  if (decision && !decision.ok) throw decision.error;
+  // Web selection still needs search results and retains its single combined call.
+  const plan = decision ? decision.plan : await decide();
 
   // Planned picks first, then everything else in rank order as replacements for reads that come
   // back unusable. Deduped, because a model asked for indices will sometimes name one twice.

@@ -32,7 +32,6 @@ primary_region = 'syd'
   app = 'node dist/index.js'
   worker = 'node dist/worker.js'
 
-
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '1gb'

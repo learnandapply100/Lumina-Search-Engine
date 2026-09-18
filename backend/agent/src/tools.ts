@@ -4,7 +4,7 @@ import { fetchPage, MAX_CHARS } from './fetchPage.js';
 import type { Spend } from './llm.js';
 import { saveMemory, recallMemory } from './memory.js';
 import { searchDocuments } from './retrieval.js';
-import { webSearch, type SearchResult } from './search.js';
+import { webSearch, type SearchResult, type PersistenceResult } from './search.js';
 import { clipChars } from './text.js';
 import type { RequestTiming } from './timing.js';
 
@@ -61,6 +61,10 @@ export type Evidence = {
 
 export type ToolContext = {
   timing?: RequestTiming;
+  pendingSearchWrites?: {
+    promise: Promise<PersistenceResult>;
+    report?: (result: PersistenceResult) => void;
+  }[];
   userId: string;
   threadId: string;
   mode: AskMode;
@@ -351,7 +355,14 @@ export async function runTool(name: string, input: ToolInput, ctx: ToolContext):
   switch (name) {
     case 'web_search': {
       const query = String(input.query ?? '');
-      const { results, cached } = await webSearch(query, ctx.spend, ctx.timing);
+      const { results, cached, persistence } = await webSearch(query, ctx.spend, ctx.timing);
+      if (persistence) {
+        if (ctx.pendingSearchWrites) ctx.pendingSearchWrites.push({ promise: persistence });
+        else {
+          const result = await persistence;
+          if (!result.ok) throw result.error;
+        }
+      }
       if (ctx.timing) ctx.timing.searchCached = cached;
       ctx.searches.total += 1;
       if (cached) ctx.searches.cached += 1;

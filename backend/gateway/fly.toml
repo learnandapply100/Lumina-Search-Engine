@@ -1,7 +1,7 @@
 # The edge. This one IS public — the browser has to reach it — and it holds no provider key.
 #
 #   fly launch --no-deploy --copy-config --dockerfile backend/gateway/Dockerfile
-#   fly secrets set AGENT_URL=http://lumina-agent.internal:8000 \
+#   fly secrets set AGENT_URL=http://lumina-agent-nehamm.internal:8000 \
 #                   CORS_ORIGINS=https://<your-vercel-app>.vercel.app
 #   fly deploy
 #

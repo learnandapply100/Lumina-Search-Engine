@@ -19,6 +19,11 @@ export const env = {
 
   llmProvider: process.env.LLM_PROVIDER ?? 'anthropic',
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  // Only for planQuickReads' routing decision — a 15-token JSON output with a
+  // rank-order fallback if parsing fails, so a faster/cheaper model costs nothing here
+  // Every other call site (planResearch, researchBranch, synthesis) keeps
+  // llmModel above.
+  routingModel: process.env.ROUTING_MODEL ?? 'claude-haiku-4-5-20251001',
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),

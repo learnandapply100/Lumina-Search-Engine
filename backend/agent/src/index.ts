@@ -228,6 +228,8 @@ app.post('/threads/:threadId/ask', async (req, res) => {
       status: res.statusCode,
       elapsedMs: record.timing.elapsedMs,
       searchCached: record.timing.searchCached,
+      searchCachePayloadBytes: record.timing.searchCachePayloadBytes,
+      searchCacheMongoMs: record.timing.searchCacheMongoMs,
       readers: record.readers
     }, 'quick_timing');
   };

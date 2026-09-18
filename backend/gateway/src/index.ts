@@ -78,20 +78,21 @@ app.use((err: Error & { status?: number; type?: string }, _req: express.Request,
 
 app.get('/health', async (_req, res) => {
   let ai: { status: 'ok' | 'down' } & Record<string, unknown> = { status: 'down' };
+  let upstreamBody: Record<string, unknown> = {};
   try {
     const upstream = await fetch(`${env.agentUrl}/health`, { signal: AbortSignal.timeout(3000) });
-    const body = (await upstream.json()) as Record<string, unknown>;
-    ai = { ...body, status: upstream.ok ? 'ok' : 'down' };
+    upstreamBody = (await upstream.json()) as Record<string, unknown>;
+    ai = { status: upstream.ok ? 'ok' : 'down' };
   } catch (err) {
     ai = { status: 'down', error: (err as Error).message };
   }
 
   const body: HealthResponse = {
     status: ai.status === 'ok' ? 'ok' : 'degraded',
-    model: String(ai.model ?? 'unset'),
-    searchProvider: (ai.searchProvider as HealthResponse['searchProvider']) ?? 'tavily',
-    vectorStore: (ai.vectorStore as HealthResponse['vectorStore']) ?? 'atlas-vector-search',
-    db: (ai.db as HealthResponse['db']) ?? 'down',
+    model: String(upstreamBody.model ?? 'unset'),
+    searchProvider: (upstreamBody.searchProvider as HealthResponse['searchProvider']) ?? 'tavily',
+    vectorStore: (upstreamBody.vectorStore as HealthResponse['vectorStore']) ?? 'atlas-vector-search',
+    db: (upstreamBody.db as HealthResponse['db']) ?? 'down',
     ai
   };
   res.status(ai.status === 'ok' ? 200 : 503).json(body);

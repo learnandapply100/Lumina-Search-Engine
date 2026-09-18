@@ -31,7 +31,8 @@ COPY --from=build /app/backend/gateway/dist backend/gateway/dist
 
 # The evaluation the /evals page renders. Baked in, so redeploying is what publishes a new
 # one — there is no writable path here that could quietly disagree with what was measured.
-COPY reports/report.jso[n] /app/reports/
+#COPY reports/report.jso[n] /app/reports/
+RUN mkdir -p /app/reports
 
 WORKDIR /app/backend/gateway
 EXPOSE 8787
