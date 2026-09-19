@@ -230,6 +230,7 @@ app.post('/threads/:threadId/ask', async (req, res) => {
       memory: record.timing.memory,
       llm: record.timing.llm,
       searchCached: record.timing.searchCached,
+      quickDecisionCached: record.timing.quickDecisionCached,
       searchCachePayloadBytes: record.timing.searchCachePayloadBytes,
       searchCacheMongoMs: record.timing.searchCacheMongoMs,
       readers: record.readers
@@ -303,7 +304,9 @@ app.post('/threads/:threadId/ask', async (req, res) => {
     createdAt: new Date()
   });
 
-  const stream = new SseStream(res);
+  const stream = new SseStream(res, (event) => {
+    if (event === 'sources') record.timing.mark('sourcesSent');
+  });
 
   // Held out here so the catch below can read what the run had spent and done. A log written
   // from constants after an exception is a log that invents its own evidence.

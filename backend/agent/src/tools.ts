@@ -78,6 +78,8 @@ export type ToolContext = {
    * was retrieved" while holding a list of pages that answer the question.
    */
   seenUrls: string[];
+  /** First deep branch that discovered a URL; shared with emergency reads. */
+  urlSubQuestions?: Map<string, number>;
   /**
    * Every search result this request has seen, in rank order, with its title and snippet.
    *
@@ -370,6 +372,7 @@ export async function runTool(name: string, input: ToolInput, ctx: ToolContext):
       for (const r of results) {
         if (ctx.seenUrls.includes(r.url)) continue;
         ctx.seenUrls.push(r.url);
+        if (ctx.subQuestion) ctx.urlSubQuestions?.set(r.url, ctx.subQuestion);
         // Kept in the same rank order as `seenUrls` and deduped on the same key, so an index
         // into one means the same result in the other.
         ctx.searchResults.push(r);

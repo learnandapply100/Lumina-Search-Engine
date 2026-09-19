@@ -37,6 +37,7 @@ export class RequestTiming {
     firstTokenSent: null as number | null
   };
   searchCached: boolean | null = null;
+  quickDecisionCached: boolean | null = null;
   /** JSON UTF-8 bytes of the Mongo update document, not BSON or wire bytes. */
   searchCachePayloadBytes: number | null = null;
   searchCacheMongoMs: number | null = null;

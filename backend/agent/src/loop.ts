@@ -1,3 +1,4 @@
+import { bufferedSynthesis } from './buffered-synthesis.js';
 import type Anthropic from '@anthropic-ai/sdk';
 import {
   type AskMode,
@@ -11,11 +12,12 @@ import {
   unresolvedCitations
 } from '@lumina/contract';
 import { env } from './env.js';
-import { createMessage, streamMessage, Spend } from './llm.js';
+import { createMessage, Spend } from './llm.js';
 import type { SearchResult } from './search.js';
 import type { SseStream } from './sse.js';
 import { clipChars } from './text.js';
 import { RequestTiming } from './timing.js';
+import { QuickDecisionCache, quickDecisionKey } from './quick-decision-cache.js';
 import {
   bestPassage,
   locatorLabel,
@@ -232,6 +234,7 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
     evidence,
     searches,
     seenUrls,
+    urlSubQuestions: new Map(),
     searchResults,
     readers,
     rawText,
@@ -247,6 +250,41 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
 
   const tools = toolsFor(mode, Boolean(spaceId), depth);
   let subQuestions: SubQuestion[] = [];
+
+  // ------------------------------------------------------------ deep: plan first, always
+  if (isDeep) {
+    const planStarted = Date.now();
+    // Reserved like any other tool call: the plan is work, and a plan that ran is a step the
+    // trace has to show.
+    budget.reserve();
+    try {
+      subQuestions = await planResearch(query, history, spend);
+    } catch (error) {
+      emitTrace({
+        tool: 'plan_research', input: { query }, ok: false,
+        ms: Date.now() - planStarted,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
+    // Visible to the caller before any retrieval starts, so a run that dies mid-fan-out is
+    // still logged as the deep run it was.
+    record.subQuestions = subQuestions;
+    // `plan` goes first on the wire: the contract's deep ordering is plan → trace* → sources,
+    // and the plan is what makes the trace steps that follow legible.
+    stream.send('plan', {
+      subQuestions,
+      reason: 'Researching each sub-question separately, then merging the citations.'
+    });
+    emitTrace({
+      tool: 'plan_research',
+      input: { query },
+      ok: true,
+      ms: Date.now() - planStarted,
+      subQuestion: subQuestions[0]!.i,
+      reason: `Shared planning for all ${subQuestions.length} sub-questions, owned by sub-question ${subQuestions[0]!.i}; completed before retrieval.`
+    });
+  }
 
   // ------------------------------------------------------------ memory, off the critical path
   /**
@@ -264,6 +302,7 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
    */
   let recalled = '';
   let recallFailure: unknown = null;
+  const sharedSubQuestion = isDeep ? subQuestions[0]!.i : undefined;
   const recallStarted = Date.now();
   const recall = (async () => {
     if (!budget.reserve()) return;
@@ -272,15 +311,19 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
       emitTrace({
         tool: 'recall_memory',
         input: { query },
+        ...(sharedSubQuestion ? { subQuestion: sharedSubQuestion } : {}),
         ok: true,
         ms: Date.now() - recallStarted,
-        reason: 'Checked what this user has asked to be remembered, before answering.'
+        reason: isDeep
+          ? `Shared memory recall for all sub-questions, owned by sub-question ${sharedSubQuestion}.`
+          : 'Checked what this user has asked to be remembered, before answering.'
       });
       if (!NOTHING_RECALLED.test(out)) recalled = out;
     } catch (err) {
       emitTrace({
         tool: 'recall_memory',
         input: { query },
+        ...(sharedSubQuestion ? { subQuestion: sharedSubQuestion } : {}),
         ok: false,
         ms: Date.now() - recallStarted,
         error: err instanceof Error ? err.message : String(err)
@@ -293,165 +336,180 @@ export async function runAsk(opts: AskOptions): Promise<AskOutcome> {
     }
   })();
 
-  // ------------------------------------------------------------ deep: plan first, always
-  if (isDeep) {
-    const planStarted = Date.now();
-    // Reserved like any other tool call: the plan is work, and a plan that ran is a step the
-    // trace has to show.
-    budget.reserve();
-    subQuestions = await planResearch(query, history, spend);
-    // Visible to the caller before any retrieval starts, so a run that dies mid-fan-out is
-    // still logged as the deep run it was.
-    record.subQuestions = subQuestions;
-    // `plan` goes first on the wire: the contract's deep ordering is plan → trace* → sources,
-    // and the plan is what makes the trace steps that follow legible.
-    stream.send('plan', {
-      subQuestions,
-      reason: 'Researching each sub-question separately, then merging the citations.'
-    });
-    emitTrace({
-      tool: 'plan_research',
-      input: { query },
-      ok: true,
-      ms: Date.now() - planStarted,
-      reason: `Decomposed the question into ${subQuestions.length} sub-questions before retrieving anything.`
-    });
-  }
-
-  // ------------------------------------------------------------ research
-  if (isDeep) {
-    // Each sub-question gets an equal share of what is left after the plan. Spending a share
-    // is a planned stop; only the global budget running dry is a cap.
-    const perBranch = Math.max(2, Math.floor((env.maxToolCallsDeep - 1) / subQuestions.length));
-    await runWithConcurrency(subQuestions, DEEP_CONCURRENCY, async (sq) => {
-      await researchBranch({
-        depth,
-        allowance: perBranch,
-        system: researchSystem(),
-        prompt: `Overall question: ${query}\n\nResearch ONLY this sub-question: ${sq.question}\nWhy it matters: ${sq.reason ?? ''}`,
-        seed: seedFor(mode, sq.question, spaceId),
-        tools,
-        ctx: { ...ctx, subQuestion: sq.i },
-        budget,
-        emitTrace,
-        subQuestion: sq.i
-      });
-    });
-  } else {
-    let researchFailure: { error: unknown } | undefined;
-    try {
-      await researchQuick({ query, history, mode, spaceId, ctx, budget, emitTrace });
-    } catch (error) {
-      researchFailure = { error };
-    }
-    // Drain even when routing/reading throws: no cache write outlives its request.
-    timing?.mark('searchCacheWaitStarted');
-    const results = await Promise.all((ctx.pendingSearchWrites ?? []).map(async (write) => {
-      const result = await write.promise;
-      write.report?.(result);
-      return result;
-    }));
-    timing?.mark('searchCacheWaitFinished');
-    const failed = results.find((result) => !result.ok);
-    if (failed && !failed.ok) throw failed.error;
-    if (researchFailure) throw researchFailure.error;
-  }
-
-  // ------------------------------------------------------------ read before giving up
-  /**
-   * Research ended holding a ranked list of pages and no evidence at all.
-   *
-   * Snippets are not evidence (SPEC §5.2), so synthesis would answer "retrieval returned
-   * nothing" while sitting on results that answer the question. Observed on "What is the
-   * capital of Portugal?", which searched twice, read nothing, and returned a non-answer about
-   * a fact in every snippet.
-   *
-   * Now mostly a deep-gear net: a sub-question's branch can still decline to read, and
-   * `researchQuick` already walks its ranked list until it has usable pages. It stays because
-   * it also covers the case both gears share — every read attempted came back unusable — and
-   * because reading here does not depend on a model making a different choice the second time.
-   * A failed fetch stays non-fatal, exactly as it is when the model asks for one.
-   */
-  if (evidence.length === 0 && seenUrls.length > 0) {
-    await Promise.all(
-      seenUrls.slice(0, PREFETCH_COUNT).map(async (url) => {
-        if (!budget.reserve()) return;
-        const t0 = Date.now();
-        try {
-          await runTool('fetch_page', { url }, ctx);
-          emitTrace({
-            tool: 'fetch_page',
-            input: { url },
-            ok: true,
-            ms: Date.now() - t0,
-            reason: 'Read the top result: the research phase ended without reading anything, and a snippet is not evidence.'
-          });
-        } catch (err) {
-          emitTrace({
-            tool: 'fetch_page',
-            input: { url },
-            ok: false,
-            ms: Date.now() - t0,
-            error: err instanceof Error ? err.message : String(err)
-          });
+  const answerId = newId('ans');
+  let ttftMs = 0;
+  let text = '';
+  function startSynthesis(sources: Source[]) {
+    const hitCap = budget.hitCap;
+    timing?.mark('synthesisStarted');
+    timing?.mark('promptStarted');
+    const synthesisParams: Anthropic.MessageStreamParams = {
+      model: env.llmModel,
+      max_tokens: isDeep ? 6000 : 1200,
+      thinking: { type: 'disabled' },
+      output_config: { effort: isDeep ? 'medium' : 'low' },
+      system: synthesisSystem(isDeep, hitCap),
+      messages: [
+        { role: 'user', content: synthesisPrompt(query, history, sources, subQuestions, isDeep, recalled) }
+      ]
+    };
+    timing?.mark('promptFinished');
+    const synthesis = bufferedSynthesis({
+      params: synthesisParams, timing, spend,
+      onText(delta) {
+        if (record.timing.elapsedMs.synthesisFirstText === null) record.timing.mark('synthesisFirstText');
+        text += delta;
+        stream.send('token', { text: delta });
+        if (record.timing.elapsedMs.firstTokenSent === null) {
+          record.timing.mark('firstTokenSent');
+          ttftMs = record.timing.elapsedMs.firstTokenSent!;
         }
-      })
-    );
+      }
+    });
+    return { ...synthesis, hitCap, sources };
+  }
+  let earlySynthesis: Promise<
+    { ok: true; synthesis?: ReturnType<typeof startSynthesis> } | { ok: false; error: unknown }
+  > | undefined;
+  const prepareDocumentSynthesis = () => {
+    earlySynthesis = recall.then(() => {
+      if (recallFailure || budget.hitCap) return { ok: true as const };
+      timing?.mark('evidenceStarted');
+      const sources = buildSources(evidence, query);
+      timing?.mark('evidenceFinished');
+      return { ok: true as const, synthesis: startSynthesis(sources) };
+    }).catch((error: unknown) => ({ ok: false as const, error }));
+  };
+  const discardEarlySynthesis = async () => {
+    const prepared = await earlySynthesis;
+    if (prepared?.ok && prepared.synthesis) {
+      prepared.synthesis.discard();
+      await prepared.synthesis.finished;
+    }
+  };
+
+  try {
+    // ------------------------------------------------------------ research
+    if (isDeep) {
+      // Each sub-question gets an equal share of what is left after the plan. Spending a share
+      // is a planned stop; only the global budget running dry is a cap.
+      const perBranch = Math.max(2, Math.floor((env.maxToolCallsDeep - 1) / subQuestions.length));
+      await runWithConcurrency(subQuestions, DEEP_CONCURRENCY, async (sq) => {
+        await researchBranch({
+          depth,
+          allowance: perBranch,
+          system: researchSystem(),
+          prompt: `Overall question: ${query}\n\nResearch ONLY this sub-question: ${sq.question}\nWhy it matters: ${sq.reason ?? ''}`,
+          seed: seedFor(mode, sq.question, spaceId),
+          tools,
+          ctx: { ...ctx, subQuestion: sq.i },
+          budget,
+          emitTrace,
+          subQuestion: sq.i
+        });
+      });
+    } else {
+      let researchFailure: { error: unknown } | undefined;
+      try {
+        await researchQuick({ query, history, mode, spaceId, ctx, budget, emitTrace, onDocumentsReady: prepareDocumentSynthesis });
+      } catch (error) {
+        researchFailure = { error };
+      }
+      // Drain even when routing/reading throws: no cache write outlives its request.
+      timing?.mark('searchCacheWaitStarted');
+      const results = await Promise.all((ctx.pendingSearchWrites ?? []).map(async (write) => {
+        const result = await write.promise;
+        write.report?.(result);
+        return result;
+      }));
+      timing?.mark('searchCacheWaitFinished');
+      const failed = results.find((result) => !result.ok);
+      if (failed && !failed.ok) throw failed.error;
+      if (researchFailure) throw researchFailure.error;
+    }
+
+    // ------------------------------------------------------------ read before giving up
+    /**
+     * Research ended holding a ranked list of pages and no evidence at all.
+     *
+     * Snippets are not evidence (SPEC §5.2), so synthesis would answer "retrieval returned
+     * nothing" while sitting on results that answer the question. Observed on "What is the
+     * capital of Portugal?", which searched twice, read nothing, and returned a non-answer about
+     * a fact in every snippet.
+     *
+     * Now mostly a deep-gear net: a sub-question's branch can still decline to read, and
+     * `researchQuick` already walks its ranked list until it has usable pages. It stays because
+     * it also covers the case both gears share — every read attempted came back unusable — and
+     * because reading here does not depend on a model making a different choice the second time.
+     * A failed fetch stays non-fatal, exactly as it is when the model asks for one.
+     */
+    if (evidence.length === 0 && seenUrls.length > 0) {
+      await Promise.all(
+        seenUrls.slice(0, PREFETCH_COUNT).map(async (url) => {
+          if (!budget.reserve()) return;
+          const subQuestion = isDeep ? ctx.urlSubQuestions?.get(url) : undefined;
+          if (isDeep && !subQuestion) throw new Error('Deep fallback URL has no originating sub-question');
+          const t0 = Date.now();
+          try {
+            await runTool('fetch_page', { url }, { ...ctx, ...(subQuestion ? { subQuestion } : {}) });
+            emitTrace({
+              tool: 'fetch_page',
+              input: { url },
+              ...(subQuestion ? { subQuestion } : {}),
+              ok: true,
+              ms: Date.now() - t0,
+              reason: 'Read the top result: the research phase ended without reading anything, and a snippet is not evidence.'
+            });
+          } catch (err) {
+            emitTrace({
+              tool: 'fetch_page',
+              input: { url },
+              ...(subQuestion ? { subQuestion } : {}),
+              ok: false,
+              ms: Date.now() - t0,
+              error: err instanceof Error ? err.message : String(err)
+            });
+          }
+        })
+      );
+    }
+
+  } catch (error) {
+    // Failure logs must include all already-started recall work and its usage.
+    await recall;
+    await discardEarlySynthesis();
+    throw error;
   }
 
   // Long since finished behind the retrieval, but a failure of it is still the run's failure.
   timing?.mark('memoryWaitStarted');
   await recall;
   timing?.mark('memoryWaitFinished');
-  if (recallFailure) throw recallFailure;
+  if (recallFailure) {
+    await discardEarlySynthesis();
+    throw recallFailure;
+  }
 
   // ------------------------------------------------------------ sources, then tokens
-  timing?.mark('evidenceStarted');
-  const sources = buildSources(evidence, query);
-  timing?.mark('evidenceFinished');
-  stream.send('sources', sources);
-  timing?.mark('sourcesSent');
-
-  const answerId = newId('ans');
-  let ttftMs = 0;
-  let text = '';
-
-  timing?.mark('synthesisStarted');
-  timing?.mark('promptStarted');
-  const synthesisParams: Anthropic.MessageStreamParams = {
-    model: env.llmModel,
-    max_tokens: isDeep ? 6000 : 1200,
-    thinking: { type: 'disabled' },
-    output_config: { effort: isDeep ? 'medium' : 'low' },
-    system: synthesisSystem(isDeep, budget.hitCap),
-    messages: [
-      { role: 'user', content: synthesisPrompt(query, history, sources, subQuestions, isDeep, recalled) }
-    ]
-  };
-  timing?.mark('promptFinished');
-  const synthStream = streamMessage(synthesisParams, timing);
-
-  synthStream.on('text', (delta) => {
-    if (!delta) return;
-    if (record.timing.elapsedMs.synthesisFirstText === null) {
-      record.timing.mark('synthesisFirstText');
-    }
-    text += delta;
-    stream.send('token', { text: delta });
-    if (record.timing.elapsedMs.firstTokenSent === null) {
-      record.timing.mark('firstTokenSent');
-      ttftMs = record.timing.elapsedMs.firstTokenSent!;
-    }
-  });
-
-  const finalMessage = await synthStream.finalMessage();
-  const synthesisTiming = timing?.llm.find((call) => call.role === 'synthesis');
-  if (synthesisTiming && timing) {
-    synthesisTiming.finished = timing.now();
-    synthesisTiming.tokensIn = finalMessage.usage.input_tokens;
-    synthesisTiming.tokensOut = finalMessage.usage.output_tokens;
+  const prepared = await earlySynthesis;
+  if (prepared && !prepared.ok) throw prepared.error;
+  let synthesis = prepared?.ok ? prepared.synthesis : undefined;
+  let sources = synthesis?.sources;
+  if (!sources) {
+    timing?.mark('evidenceStarted');
+    sources = buildSources(evidence, query);
+    timing?.mark('evidenceFinished');
   }
-  spend.addUsage(finalMessage.usage);
+  if (synthesis && budget.hitCap && !synthesis.hitCap) {
+    synthesis.discard();
+    const result = await synthesis.finished;
+    if (!result.ok) throw result.error;
+    synthesis = undefined;
+  }
+  synthesis ??= startSynthesis(sources);
+  synthesis.release(() => stream.send('sources', sources));
+  const result = await synthesis.finished;
+  if (!result.ok) throw result.error;
 
   // The stream is already out, so this cannot retract anything — it is a log line that turns a
   // silent grounding failure into one that names itself in the run's own logs.
@@ -565,7 +623,10 @@ type QuickPlan = {
   save: string | null;
   /** True when the model did not answer in the shape asked for and rank order was used instead. */
   degraded: boolean;
+  cached?: boolean;
 };
+
+const quickDecisions = new QuickDecisionCache();
 
 /**
  * The quick gear's single model turn: which results are worth reading, and is there anything to
@@ -581,6 +642,8 @@ type QuickPlan = {
  * tell that the top hit is a pricing page and the third is the documentation.
  */
 async function planQuickReads(opts: {
+  userId: string;
+  spaceId?: string;
   query: string;
   history: AskOptions['history'];
   results: SearchResult[];
@@ -596,7 +659,7 @@ async function planQuickReads(opts: {
 
   // NOT wrapped in try/catch: a provider exception here is the run's failure and has to reach
   // the caller as one. Only the *parse* below degrades, and it degrades visibly.
-  const res = await createMessage({
+  const params: Anthropic.MessageCreateParamsNonStreaming = {
     model: env.routingModel,
     // Room for a saved preference sentence and nothing more. The output is the latency.
     max_tokens: 200,
@@ -627,7 +690,12 @@ async function planQuickReads(opts: {
     messages: [
       { role: 'user', content: `${contextualQuery(query, history)}\n\nSearch results:\n${candidates}` }
     ]
-  }, opts.timing);
+  };
+  const key = quickDecisionKey([opts.userId, opts.spaceId, query, history], params);
+  const cached = quickDecisions.get(key);
+  if (opts.timing) opts.timing.quickDecisionCached = Boolean(cached);
+  if (cached) return { ...cached, cached: true };
+  const res = await createMessage(params, opts.timing);
   spend.addUsage(res.usage);
 
   const raw = res.content.find((b): b is Anthropic.TextBlock => b.type === 'text')?.text ?? '';
@@ -644,7 +712,16 @@ async function planQuickReads(opts: {
     const save = typeof parsed.save === 'string' && parsed.save.trim() ? parsed.save.trim() : null;
     // An empty or unusable `read` is not a failure of the model's judgement, it is a failure to
     // express it — rank order is the honest fallback and the caller says so in the trace.
-    return read.length ? { read, save, degraded: false } : { read: rankOrder, save, degraded: true };
+    const plan = read.length ? { read, save, degraded: false } : { read: rankOrder, save, degraded: true };
+    // Cache only an explicit null save and a complete, valid selection. Empty selections
+    // are valid only when no web candidates existed; retain the existing degraded flag.
+    const validRead = Array.isArray(parsed.read) && parsed.read.length <= PREFETCH_COUNT &&
+      parsed.read.every((n) => Number.isInteger(n) && n >= 1 && n <= results.length) &&
+      (results.length === 0 ? parsed.read.length === 0 : parsed.read.length > 0);
+    if (res.stop_reason === 'end_turn' && parsed.save === null && validRead) {
+      quickDecisions.set(key, { ...plan, save: null });
+    }
+    return plan;
   } catch {
     return { read: rankOrder, save: null, degraded: true };
   }
@@ -666,13 +743,14 @@ async function researchQuick(opts: {
   ctx: ToolContext;
   budget: Budget;
   emitTrace: (ev: Omit<TraceEvent, 'step'>) => void;
+  onDocumentsReady?: () => void;
 }): Promise<void> {
   const { query, history, mode, spaceId, ctx, budget, emitTrace } = opts;
 
   const seed = seedFor(mode, query, spaceId);
   const decide = () => {
     ctx.timing?.mark('routingStarted');
-    return planQuickReads({ query, history, results: ctx.searchResults, spend: ctx.spend, timing: ctx.timing })
+    return planQuickReads({ userId: ctx.userId, spaceId, query, history, results: ctx.searchResults, spend: ctx.spend, timing: ctx.timing })
       .finally(() => ctx.timing?.mark('routingFinished'));
   };
   // Documents never populate web candidates, so this existing call can decide memory while
@@ -697,6 +775,9 @@ async function researchQuick(opts: {
     }
   }
 
+  // Document evidence is independent of the memory-only decision. The caller holds
+  // provider text until this function (including any save) succeeds.
+  if (documentDecision) opts.onDocumentsReady?.();
   const decision = await documentDecision;
   if (decision && !decision.ok) throw decision.error;
   // Web selection still needs search results and retains its single combined call.
@@ -730,7 +811,9 @@ async function researchQuick(opts: {
         reason: chosen.has(r.url)
           ? plan.degraded
             ? 'Read the top-ranked result: the routing step did not name any, so rank order stood in.'
-            : 'Read a result the routing step picked as most likely to answer the question.'
+            : plan.cached
+              ? 'Read a result selected by a cached model decision for identical routing inputs; fetch it for this request.'
+              : 'Read a result the routing step picked as most likely to answer the question.'
           : 'Read further down the ranked results, because a page picked above came back unusable.'
       });
       return true;
@@ -864,7 +947,7 @@ async function researchBranch(opts: {
 
     // Parallel tool_use blocks run concurrently and every result comes back in ONE user
     // message — splitting them teaches the model to stop asking for parallel calls.
-    const results = await Promise.all(
+    const results = await settleAll(
       uses.map(async (use): Promise<Anthropic.ToolResultBlockParam> => {
         const input = (use.input ?? {}) as Record<string, unknown>;
         const why = typeof input.reason === 'string' ? input.reason : undefined;
@@ -939,7 +1022,7 @@ async function runWithConcurrency<T>(items: T[], limit: number, fn: (item: T) =>
       await fn(item);
     }
   });
-  await Promise.all(workers);
+  await settleAll(workers);
 }
 
 // ---------------------------------------------------------------- planning
@@ -1111,4 +1194,11 @@ export function buildSources(evidence: Evidence[], query: string): Source[] {
   }
 
   return [...byKey.values()];
+}
+
+async function settleAll<T>(work: Promise<T>[]): Promise<T[]> {
+  const results = await Promise.allSettled(work);
+  const failed = results.find((r) => r.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
+  return results.map((r) => (r as PromiseFulfilledResult<T>).value);
 }
