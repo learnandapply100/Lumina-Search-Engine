@@ -4,6 +4,17 @@ export class RequestTiming {
 
   readonly elapsedMs = {
     requestReceived: 0,
+    validationStarted: null as number | null,
+    validationFinished: null as number | null,
+    historyLoadStarted: null as number | null,
+    historyLoadFinished: null as number | null,
+    selectionStarted: null as number | null,
+    selectionFinished: null as number | null,
+    evidenceStarted: null as number | null,
+    evidenceFinished: null as number | null,
+    sourcesSent: null as number | null,
+    promptStarted: null as number | null,
+    promptFinished: null as number | null,
     researchStarted: null as number | null,
     searchStarted: null as number | null,
     searchFinished: null as number | null,
@@ -29,6 +40,31 @@ export class RequestTiming {
   /** JSON UTF-8 bytes of the Mongo update document, not BSON or wire bytes. */
   searchCachePayloadBytes: number | null = null;
   searchCacheMongoMs: number | null = null;
+  readonly memory = {
+    memoryRecallMs: null as number | null,
+    memoryDbMs: null as number | null,
+    memoryEmbeddingMs: null as number | null,
+    memoryVectorSearchMs: null as number | null,
+    memoryScanMs: null as number | null
+  };
+  readonly llm: {
+    role: string;
+    model: string;
+    started: number;
+    attempts: { started: number; headers: number | null }[];
+    finished?: number;
+    tokensIn?: number;
+    tokensOut?: number;
+  }[] = [];
+
+  async measureMemory<T>(name: keyof RequestTiming['memory'], fn: () => Promise<T>): Promise<T> {
+    const started = this.now();
+    try {
+      return await fn();
+    } finally {
+      this.memory[name] = this.now() - started;
+    }
+  }
 
   now(): number {
     return performance.now() - this.receivedAt;

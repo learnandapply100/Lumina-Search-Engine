@@ -447,7 +447,8 @@ export async function runTool(name: string, input: ToolInput, ctx: ToolContext):
       const found = await recallMemory({
         userId: ctx.userId,
         query: String(input.query ?? ''),
-        spend: ctx.spend
+        spend: ctx.spend,
+        timing: ctx.timing
       });
       return found.length ? found.map((t, i) => `${i + 1}. ${t}`).join('\n') : 'Nothing saved that matches.';
     }

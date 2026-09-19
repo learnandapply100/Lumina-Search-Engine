@@ -227,6 +227,8 @@ app.post('/threads/:threadId/ask', async (req, res) => {
       depth: 'quick',
       status: res.statusCode,
       elapsedMs: record.timing.elapsedMs,
+      memory: record.timing.memory,
+      llm: record.timing.llm,
       searchCached: record.timing.searchCached,
       searchCachePayloadBytes: record.timing.searchCachePayloadBytes,
       searchCacheMongoMs: record.timing.searchCacheMongoMs,
@@ -242,7 +244,9 @@ app.post('/threads/:threadId/ask', async (req, res) => {
 
   // Everything that can produce a status code happens BEFORE the stream opens. Once a byte is
   // written the response is a 200 forever, so validation, 404 and the spend gate all run first.
+  record.timing.mark('validationStarted');
   const parsed = AskBody.safeParse(req.body ?? {});
+  record.timing.mark('validationFinished');
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body', status: 400 });
   }
@@ -250,6 +254,7 @@ app.post('/threads/:threadId/ask', async (req, res) => {
 
   // These are independent reads and every serial Atlas round trip lands directly on the path
   // to the first token, so they go together rather than one after another.
+  record.timing.mark('historyLoadStarted');
   const [thread, space, priorMessages] = await Promise.all([
     database.collection<ThreadDoc>(COLLECTIONS.threads).findOne({ _id: threadId, userId: ctx.userId }),
     spaceId
@@ -262,6 +267,7 @@ app.post('/threads/:threadId/ask', async (req, res) => {
       .toArray()
   ]);
 
+  record.timing.mark('historyLoadFinished');
   if (!thread) return res.status(404).json({ error: 'no such thread', status: 404 });
   if (spaceId && !space) return res.status(404).json({ error: 'no such space', status: 404 });
 

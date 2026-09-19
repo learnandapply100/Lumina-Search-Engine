@@ -7,7 +7,8 @@ import {
 } from '@lumina/contract';
 import { db } from './db.js';
 import { env } from './env.js';
-import { embedOne, type Spend } from './llm.js';
+import { type Spend } from './llm.js';
+import { embedQuery } from './query-embedding.js';
 
 export type RetrievedChunk = {
   docId: string;
@@ -71,7 +72,7 @@ export async function searchDocuments(opts: {
 }): Promise<RetrievedChunk[]> {
   const { userId, spaceId, query, limit = 5, spend } = opts;
   const chunks = (await db()).collection<ChunkDoc>(COLLECTIONS.chunks);
-  const queryVector = await embedOne(query, spend);
+  const queryVector = await embedQuery(query, spend);
 
   let vectorHits: ChunkDoc[];
   let textHits: ChunkDoc[] = [];

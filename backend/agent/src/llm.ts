@@ -3,6 +3,38 @@ import OpenAI from 'openai';
 import { EMBEDDING_DIMS } from '@lumina/contract';
 import { env, secrets } from './env.js';
 import { scrubPayload, stripLoneSurrogates } from './text.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { subscribe } from 'node:diagnostics_channel';
+import type { RequestTiming } from './timing.js';
+
+// Observe Node fetch without replacing the SDK transport or changing its retry policy.
+const providerTiming = new AsyncLocalStorage<{
+  timing: RequestTiming;
+  call: RequestTiming['llm'][number];
+}>();
+const httpTimings = new WeakMap<object, {
+  timing: RequestTiming;
+  attempt: RequestTiming['llm'][number]['attempts'][number];
+}>();
+subscribe('undici:request:create', (message) => {
+  const ctx = providerTiming.getStore();
+  if (ctx) {
+    const attempt = { started: ctx.timing.now(), headers: null };
+    ctx.call.attempts.push(attempt);
+    httpTimings.set((message as { request: object }).request, { timing: ctx.timing, attempt });
+  }
+});
+subscribe('undici:request:headers', (message) => {
+  const ctx = httpTimings.get((message as { request: object }).request);
+  if (ctx) ctx.attempt.headers = ctx.timing.now();
+});
+
+function timedCall<T>(model: string, role: string, timing: RequestTiming | undefined, fn: () => T): T {
+  if (!timing) return fn();
+  const call: RequestTiming['llm'][number] = { role, model, started: timing.now(), attempts: [] };
+  timing.llm.push(call);
+  return providerTiming.run({ timing, call }, fn);
+}
 
 /**
  * Deliberately not exported. `createMessage` and `streamMessage` below are the only ways to
@@ -19,13 +51,24 @@ export const openai = new OpenAI({ apiKey: secrets.openai });
  * rather than at each prompt builder means a new prompt cannot reintroduce it.
  */
 export function createMessage(
-  params: Anthropic.MessageCreateParamsNonStreaming
+  params: Anthropic.MessageCreateParamsNonStreaming,
+  timing?: RequestTiming
 ): Promise<Anthropic.Message> {
-  return anthropic.messages.create(scrubPayload(params));
+  return timedCall(params.model, 'routing', timing, () => {
+    const call = providerTiming.getStore()?.call;
+    return anthropic.messages.create(scrubPayload(params)).then((res) => {
+      if (call && timing) {
+        call.finished = timing.now();
+        call.tokensIn = res.usage.input_tokens;
+        call.tokensOut = res.usage.output_tokens;
+      }
+      return res;
+    });
+  });
 }
 
-export function streamMessage(params: Anthropic.MessageStreamParams) {
-  return anthropic.messages.stream(scrubPayload(params));
+export function streamMessage(params: Anthropic.MessageStreamParams, timing?: RequestTiming) {
+  return timedCall(params.model, 'synthesis', timing, () => anthropic.messages.stream(scrubPayload(params)));
 }
 
 /**

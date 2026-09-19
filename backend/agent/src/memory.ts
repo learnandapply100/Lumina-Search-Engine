@@ -2,6 +2,8 @@ import { COLLECTIONS, SEARCH_INDEXES, newId, type Memory, type MemoryDoc } from 
 import { db } from './db.js';
 import { env } from './env.js';
 import { embedOne, type Spend } from './llm.js';
+import { embedQuery } from './query-embedding.js';
+import type { RequestTiming } from './timing.js';
 
 const memories = async () => (await db()).collection<MemoryDoc>(COLLECTIONS.memories);
 
@@ -44,15 +46,31 @@ export async function recallMemory(opts: {
   query: string;
   limit?: number;
   spend?: Spend;
+  timing?: RequestTiming;
+}): Promise<string[]> {
+  if (opts.timing) {
+    return opts.timing.measureMemory('memoryRecallMs', () => recallMemoryMeasured(opts));
+  }
+  return recallMemoryMeasured(opts);
+}
+
+async function recallMemoryMeasured(opts: {
+  userId: string;
+  query: string;
+  limit?: number;
+  spend?: Spend;
+  timing?: RequestTiming;
 }): Promise<string[]> {
   const { userId, query, limit = 5, spend } = opts;
-  const collection = await memories();
+  const measure = <T>(name: keyof RequestTiming['memory'], fn: () => Promise<T>) =>
+    opts.timing ? opts.timing.measureMemory(name, fn) : fn();
+  const collection = await measure('memoryDbMs', memories);
   const t0 = Date.now();
-  const queryVector = await embedOne(query, spend);
+  const queryVector = await measure('memoryEmbeddingMs', () => embedQuery(query, spend));
   const t1 = Date.now();
 
   if (env.vectorBackend === 'mongo-cosine-scan') {
-    const all = await collection.find({ userId }).toArray();
+    const all = await measure('memoryScanMs', () => collection.find({ userId }).toArray());
     return all
       .map((m) => {
         let dot = 0;
@@ -72,7 +90,7 @@ export async function recallMemory(opts: {
       .map((m) => m.text);
   }
 
-  const hits = await collection
+  const hits = await measure('memoryVectorSearchMs', () => collection
     .aggregate<{ text: string }>([
       {
         $vectorSearch: {
@@ -86,7 +104,7 @@ export async function recallMemory(opts: {
       },
       { $project: { text: 1 } }
     ])
-    .toArray();
+    .toArray());
   const t2 = Date.now();
   console.log(`embed: ${t1 - t0}ms, vectorSearch: ${t2 - t1}ms`);
 
